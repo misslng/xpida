@@ -41,6 +41,9 @@ KPM_DESCRIPTION("xpida Process Memory Tool");
 #define OUTPUT_PATH_DUMP "/data/local/tmp/xpida_dump.bin"
 #define DUMP_CHUNK       (4096 * 16)
 
+/* ---- Config ---- */
+static bool use_fn_access_process_vm = false;
+
 /* ---- Global state ---- */
 
 static int g_ready;
@@ -57,6 +60,7 @@ static int16_t g_vm_file_off  = -1;
 static int16_t g_vm_pgoff_off = -1;
 
 static uint64_t g_linear_voffset;
+static int g_user_page_level = 3;
 
 static void *(*fn_vmalloc)(unsigned long size);
 static void (*fn_vfree)(const void *addr);
@@ -256,26 +260,58 @@ static void probe_vma_offsets(uintptr_t mm_addr)
 
 static void compute_linear_voffset(void)
 {
-    uintptr_t init_mm_sym = kallsyms_lookup_name("init_mm");
-    if (!init_mm_sym) return;
-    uintptr_t init_mm = *(uintptr_t *)init_mm_sym;
-    if (!init_mm) return;
+    uintptr_t init_mm_addr = kallsyms_lookup_name("init_mm");
+    if (!init_mm_addr) return;
 
-    uintptr_t kern_pgd = 0;
-    safe_read_ptr(init_mm + g_pgd_off, &kern_pgd);
-    if (kern_pgd < 0xffff000000000000ULL) return;
+    uintptr_t kern_pgd_va = 0;
+    safe_read_ptr(init_mm_addr + g_pgd_off, &kern_pgd_va);
+    if (kern_pgd_va < 0xffff000000000000ULL) return;
 
-    /*
-     * Use a stack variable address (guaranteed in linear mapping on arm64)
-     * to compute linear_voffset = VA - PA.
-     */
-    volatile uint64_t anchor = 0xdeadbeef;
-    uint64_t va = (uint64_t)&anchor;
-    uint64_t pa = pgtable_phys(kern_pgd, va);
-    if (pa) {
-        g_linear_voffset = va - pa;
-        pr_info("[xpida] linear_voffset: %llx\n", (unsigned long long)g_linear_voffset);
+    uint64_t ttbr1;
+    asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
+    uint64_t kern_pgd_pa = ttbr1 & 0x0000FFFFFFFFF000ULL;
+    if (!kern_pgd_pa) return;
+
+    g_linear_voffset = kern_pgd_va - kern_pgd_pa;
+    pr_info("[xpida] linear_voffset: %llx (pgd_va=%lx pgd_pa=%llx)\n",
+            (unsigned long long)g_linear_voffset,
+            (unsigned long)kern_pgd_va, (unsigned long long)kern_pgd_pa);
+
+    uint64_t tcr;
+    asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
+    uint64_t t0sz = tcr & 0x3f;
+    uint64_t user_va = 64 - t0sz;
+    g_user_page_level = (int)((user_va - 4) / 9);
+    pr_info("[xpida] user_va_bits=%llu page_level=%d\n",
+            (unsigned long long)user_va, g_user_page_level);
+}
+
+static uint64_t safe_pgtable_phys_user(uint64_t pgd_va, uint64_t va)
+{
+    uint64_t pxd_va = pgd_va;
+    uint64_t pxd_pa = 0;
+    for (int lv = 4 - g_user_page_level; lv < 4; ++lv) {
+        uint64_t shift = 9 * (4 - lv) + 3;
+        uint64_t idx = (va >> shift) & 0x1ff;
+        uint64_t desc = 0;
+        if (safe_read_ptr(pxd_va + idx * 8, (uintptr_t *)&desc) != 0)
+            return 0;
+        uint8_t type = desc & 0x3;
+        if (type == 0x3) {
+            pxd_pa = desc & 0x0000FFFFFFFFF000ULL;
+        } else if (type == 0x1) {
+            int bits = (3 - lv) * 9;
+            uint64_t bb = bits + 12;
+            uint64_t bm = ((1ULL << (48 - bb)) - 1) << bb;
+            uint64_t om = ((1ULL << bits) - 1) << 12;
+            pxd_pa = (desc & bm) + (va & om);
+            return pxd_pa + (va & 0xfff);
+        } else {
+            return 0;
+        }
+        pxd_va = pxd_pa + g_linear_voffset;
     }
+    return pxd_pa ? pxd_pa + (va & 0xfff) : 0;
 }
 
 static int resolve_offsets(void)
@@ -524,7 +560,7 @@ static long cmd_read(const char *args, char *__user out_msg, int outlen)
                 while (rem > 0) {
                     int poff = cur & (PAGE_SZ - 1);
                     int chunk = rem < (PAGE_SZ - poff) ? rem : (PAGE_SZ - poff);
-                    uint64_t pa = pgtable_phys(pgd, cur);
+                    uint64_t pa = safe_pgtable_phys_user(pgd, cur);
                     if (pa)
                         safe_read_buf(pa + g_linear_voffset, kbuf + total, chunk);
                     else
@@ -590,7 +626,10 @@ static long cmd_dump(const char *args, char *__user out_msg, int outlen)
     int32_t pid = 0;
     unsigned long start = 0, end = 0;
 
-    if (sscanf(args, "%d %lx %lx", &pid, &start, &end) != 3) return -1;
+    int nr = sscanf(args, "%d %lx %lx", &pid, &start, &end);
+    pr_info("[xpida] dump: parse nr=%d pid=%d start=%lx end=%lx\n",
+            nr, pid, start, end);
+    if (nr != 3) return -1;
     if (pid <= 0 || end <= start) return -1;
 
     unsigned long total_size = end - start;
@@ -599,19 +638,34 @@ static long cmd_dump(const char *args, char *__user out_msg, int outlen)
     if (fn_rcu_lock) fn_rcu_lock();
     uintptr_t task_addr = find_task_by_pid(pid);
     if (fn_rcu_unlock) fn_rcu_unlock();
-    if (!task_addr) return -1;
+    if (!task_addr) { pr_info("[xpida] dump: task not found\n"); return -1; }
 
-    if (!fn_filp_open || !fn_kernel_write || !fn_filp_close) return -1;
+    if (!fn_filp_open || !fn_kernel_write || !fn_filp_close) {
+        pr_info("[xpida] dump: file_io missing\n"); return -1;
+    }
     struct file *fp = fn_filp_open(OUTPUT_PATH_DUMP,
                                    0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
-    if (!fp || PTR_IS_ERR(fp)) return -1;
+    if (!fp || PTR_IS_ERR(fp)) { pr_info("[xpida] dump: filp_open fail\n"); return -1; }
 
     char *chunk = fn_vmalloc(DUMP_CHUNK);
     if (!chunk) { fn_filp_close(fp, 0); return -1; }
 
-    long long fpos = 0;
+    long long file_pos = 0;
     unsigned long cur = start;
     long written = 0;
+
+    uintptr_t mm = 0, pgd = 0;
+    if (!fn_access_process_vm && g_linear_voffset) {
+        safe_read_ptr(task_addr + g_mm_off, &mm);
+        if (mm >= 0xffff000000000000ULL)
+            safe_read_ptr(mm + g_pgd_off, &pgd);
+    }
+    pr_info("[xpida] dump: apm=%s voff=%llx mm=%lx pgd=%lx plvl=%d\n",
+            fn_access_process_vm ? "yes" : "no",
+            (unsigned long long)g_linear_voffset,
+            (unsigned long)mm, (unsigned long)pgd, g_user_page_level);
+
+    int dbg_n = 0, dbg_pa_ok = 0, dbg_pa_zero = 0, dbg_rd_ok = 0, dbg_rd_fail = 0;
 
     while (cur < start + total_size) {
         int sz = DUMP_CHUNK;
@@ -620,35 +674,43 @@ static long cmd_dump(const char *args, char *__user out_msg, int outlen)
         int got = 0;
         if (fn_access_process_vm) {
             got = fn_access_process_vm((void *)task_addr, cur, chunk, sz, FOLL_FORCE);
-        } else if (g_linear_voffset) {
-            uintptr_t mm = 0;
-            safe_read_ptr(task_addr + g_mm_off, &mm);
-            if (mm >= 0xffff000000000000ULL) {
-                uintptr_t pgd = 0;
-                safe_read_ptr(mm + g_pgd_off, &pgd);
-                if (pgd >= 0xffff000000000000ULL) {
-                    int pos2 = 0, rem = sz;
-                    unsigned long c = cur;
-                    while (rem > 0) {
-                        int poff = c & (PAGE_SZ - 1);
-                        int blk = rem < (PAGE_SZ - poff) ? rem : (PAGE_SZ - poff);
-                        uint64_t pa = pgtable_phys(pgd, c);
-                        if (pa)
-                            safe_read_buf(pa + g_linear_voffset, chunk + pos2, blk);
-                        else
-                            for (int z = 0; z < blk; z++) chunk[pos2 + z] = 0;
-                        c += blk; pos2 += blk; rem -= blk;
-                    }
-                    got = sz;
+        } else if (g_linear_voffset && pgd >= 0xffff000000000000ULL) {
+            int pos2 = 0, rem = sz;
+            unsigned long c = cur;
+            while (rem > 0) {
+                int poff = c & (PAGE_SZ - 1);
+                int blk = rem < (PAGE_SZ - poff) ? rem : (PAGE_SZ - poff);
+                uint64_t pa = safe_pgtable_phys_user(pgd, c);
+                if (pa) {
+                    dbg_pa_ok++;
+                    uintptr_t kva = pa + g_linear_voffset;
+                    int rc = safe_read_buf(kva, chunk + pos2, blk);
+                    if (rc == 0) dbg_rd_ok++; else dbg_rd_fail++;
+                    if (dbg_n < 4)
+                        pr_info("[xpida] pg[%d] va=%lx pa=%llx kva=%lx rc=%d\n",
+                                dbg_n, (unsigned long)c,
+                                (unsigned long long)pa, (unsigned long)kva, rc);
+                } else {
+                    dbg_pa_zero++;
+                    for (int z = 0; z < blk; z++) chunk[pos2 + z] = 0;
+                    if (dbg_n < 4)
+                        pr_info("[xpida] pg[%d] va=%lx pa=0 (unmapped)\n",
+                                dbg_n, (unsigned long)c);
                 }
+                dbg_n++;
+                c += blk; pos2 += blk; rem -= blk;
             }
+            got = sz;
         }
 
         if (got <= 0) break;
-        write_file_append(fp, chunk, got, &fpos);
+        write_file_append(fp, chunk, got, &file_pos);
         written += got;
         cur += got;
     }
+
+    pr_info("[xpida] dump: total_pg=%d pa_ok=%d pa_zero=%d rd_ok=%d rd_fail=%d written=%ld\n",
+            dbg_n, dbg_pa_ok, dbg_pa_zero, dbg_rd_ok, dbg_rd_fail, written);
 
     if (fn_vfs_fsync) fn_vfs_fsync(fp, 0);
     fn_filp_close(fp, 0);
@@ -714,8 +776,12 @@ static long xpida_init(const char *args, const char *event, void *__user reserve
     fn_rcu_lock = (void (*)(void))kallsyms_lookup_name("__rcu_read_lock");
     fn_rcu_unlock = (void (*)(void))kallsyms_lookup_name("__rcu_read_unlock");
     fn_d_path = (typeof(fn_d_path))kallsyms_lookup_name("d_path");
-    fn_access_process_vm = (typeof(fn_access_process_vm))
-        kallsyms_lookup_name("access_process_vm");
+    if (use_fn_access_process_vm) {
+        fn_access_process_vm = (typeof(fn_access_process_vm))
+            kallsyms_lookup_name("access_process_vm");
+    } else {
+        fn_access_process_vm = NULL;
+    }
 
     fn_filp_open = (typeof(fn_filp_open))kallsyms_lookup_name("filp_open");
     fn_kernel_write = (typeof(fn_kernel_write))kallsyms_lookup_name("kernel_write");
