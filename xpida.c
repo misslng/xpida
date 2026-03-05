@@ -839,10 +839,10 @@ static void before_userfaultfd(hook_fargs4_t *fargs, void *udata)
 
     fargs->skip_origin = 1;
 
-    if (current_uid() != 0) {
-        fargs->ret = (uint64_t)(long)-1;
-        return;
-    }
+    // if (current_uid() != 0) {
+    //     fargs->ret = (uint64_t)(long)-1;
+    //     return;
+    // }
 
     if (!g_ready) {
         fargs->ret = (uint64_t)(long)-1;
