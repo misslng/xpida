@@ -258,43 +258,122 @@ static void probe_vma_offsets(uintptr_t mm_addr)
     }
 }
 
+/*
+ * AT S1E1R：ARM64 硬件地址翻译指令，让 CPU 走当前 EL1 页表返回 PA。
+ * 翻译失败只是在 PAR_EL1 里标记 F=1，不会 crash。
+ * 比 pgtable_phys（内部做直接内存读取，给错 VA 会 panic）安全得多。
+ */
+static uint64_t at_translate_el1(uint64_t va)
+{
+    uint64_t par;
+    asm volatile(
+        "at s1e1r, %1\n"
+        "isb\n"
+        "mrs %0, par_el1\n"
+        : "=r"(par) : "r"(va));
+    if (par & 1)
+        return 0;
+    return (par & 0x0000FFFFFFFFF000ULL) | (va & 0xFFF);
+}
+
 static void compute_linear_voffset(void)
 {
-    uintptr_t init_mm_addr = kallsyms_lookup_name("init_mm");
-    if (!init_mm_addr) return;
-
-    uintptr_t kern_pgd_va = 0;
-    safe_read_ptr(init_mm_addr + g_pgd_off, &kern_pgd_va);
-    if (kern_pgd_va < 0xffff000000000000ULL) return;
-
-    uint64_t ttbr1;
-    asm volatile("mrs %0, ttbr1_el1" : "=r"(ttbr1));
-    uint64_t kern_pgd_pa = ttbr1 & 0x0000FFFFFFFFF000ULL;
-    if (!kern_pgd_pa) return;
-
-    g_linear_voffset = kern_pgd_va - kern_pgd_pa;
-    pr_info("[xpida] linear_voffset: %llx (pgd_va=%lx pgd_pa=%llx)\n",
-            (unsigned long long)g_linear_voffset,
-            (unsigned long)kern_pgd_va, (unsigned long long)kern_pgd_pa);
-
     uint64_t tcr;
     asm volatile("mrs %0, tcr_el1" : "=r"(tcr));
+
+    uint64_t t1sz = (tcr >> 16) & 0x3f;
+    uint64_t kern_va_bits = 64 - t1sz;
+
     uint64_t t0sz = tcr & 0x3f;
-    uint64_t user_va = 64 - t0sz;
-    g_user_page_level = (int)((user_va - 4) / 9);
+    uint64_t user_va_bits = 64 - t0sz;
+    g_user_page_level = (int)((user_va_bits - 4) / 9);
+
+    pr_info("[xpida] tcr: t0sz=%llu user_va=%llu t1sz=%llu kern_va=%llu\n",
+            (unsigned long long)t0sz, (unsigned long long)user_va_bits,
+            (unsigned long long)t1sz, (unsigned long long)kern_va_bits);
+
+    int found = 0;
+
+    /*
+     * 方法 1：直接读内核的 physvirt_offset（arm64 5.x 都有导出）。
+     *         physvirt_offset = PAGE_OFFSET - PHYS_OFFSET，
+     *         __phys_to_virt(pa) = pa + physvirt_offset，和我们的 linear_voffset 语义完全一致。
+     */
+    int64_t *p_pvo = (int64_t *)kallsyms_lookup_name("physvirt_offset");
+    if (p_pvo) {
+        int64_t pvo = 0;
+        if (safe_read_buf((uintptr_t)p_pvo, &pvo, sizeof(pvo)) == 0 && pvo != 0) {
+            g_linear_voffset = (uint64_t)pvo;
+            found = 1;
+            pr_info("[xpida] linear_voffset: %llx (physvirt_offset @ %lx)\n",
+                    (unsigned long long)g_linear_voffset, (unsigned long)p_pvo);
+        }
+    }
+
+    /*
+     * 方法 2：AT 翻译一个 slab 分配的 task_struct 地址。
+     *         init_task 在 kimage .data 区，但链表里下一个 task 是 slab 分配的，
+     *         一定在线性映射区，用 AT 翻译它就能精确算出 linear_voffset。
+     */
+    if (!found && g_tasks_off > 0) {
+        uintptr_t next = 0;
+        safe_read_ptr((uintptr_t)g_init_task + g_tasks_off, &next);
+        if (next && next != (uintptr_t)g_init_task + g_tasks_off) {
+            uintptr_t task_va = next - g_tasks_off;
+            uint64_t task_pa = at_translate_el1((uint64_t)task_va);
+            if (task_pa) {
+                g_linear_voffset = (uint64_t)task_va - task_pa;
+                found = 1;
+                pr_info("[xpida] linear_voffset: %llx (AT task: va=%lx pa=%llx)\n",
+                        (unsigned long long)g_linear_voffset,
+                        (unsigned long)task_va, (unsigned long long)task_pa);
+            }
+        }
+    }
+
+    /*
+     * 方法 3：memstart_addr 回退。
+     *         5.4+:  PAGE_OFFSET = -(1ULL << VA_BITS)
+     *         旧版:  PAGE_OFFSET = ~0ULL << (VA_BITS - 1)
+     *         linear_voffset = PAGE_OFFSET - memstart_addr
+     */
+    if (!found) {
+        uint64_t memstart = 0;
+        int64_t *p_ms = (int64_t *)kallsyms_lookup_name("memstart_addr");
+        if (p_ms)
+            safe_read_buf((uintptr_t)p_ms, &memstart, sizeof(memstart));
+        uint64_t page_offset = 0ULL - (1ULL << kern_va_bits);
+        g_linear_voffset = page_offset - memstart;
+        pr_info("[xpida] linear_voffset: %llx (fallback: po=%llx ms=%llx)\n",
+                (unsigned long long)g_linear_voffset,
+                (unsigned long long)page_offset,
+                (unsigned long long)memstart);
+    }
+
     pr_info("[xpida] user_va_bits=%llu page_level=%d\n",
-            (unsigned long long)user_va, g_user_page_level);
+            (unsigned long long)user_va_bits, g_user_page_level);
 }
+
+static int g_walk_dbg = 0;
 
 static uint64_t safe_pgtable_phys_user(uint64_t pgd_va, uint64_t va)
 {
+    int dbg = g_walk_dbg > 0;
+    if (dbg) g_walk_dbg--;
+
     uint64_t pxd_va = pgd_va;
     uint64_t pxd_pa = 0;
     for (int lv = 4 - g_user_page_level; lv < 4; ++lv) {
         uint64_t shift = 9 * (4 - lv) + 3;
         uint64_t idx = (va >> shift) & 0x1ff;
         uint64_t desc = 0;
-        if (safe_read_ptr(pxd_va + idx * 8, (uintptr_t *)&desc) != 0)
+        int rc = safe_read_ptr(pxd_va + idx * 8, (uintptr_t *)&desc);
+        if (dbg)
+            pr_info("[xpida] walk lv=%d pxd_va=%llx idx=%llu addr=%llx rc=%d desc=%llx type=%d\n",
+                    lv, (unsigned long long)pxd_va, (unsigned long long)idx,
+                    (unsigned long long)(pxd_va + idx * 8), rc,
+                    (unsigned long long)desc, (int)(desc & 3));
+        if (rc != 0)
             return 0;
         uint8_t type = desc & 0x3;
         if (type == 0x3) {
