@@ -8,7 +8,7 @@
  * Usage: xpida_cli <cmd> [args]
  *
  * Commands:
- *   ping, ps, psx, find <name>, maps <pid>,
+ *   ping, ps, find <name>, maps <pid>,
  *   read <pid> <hex_addr> <size>,
  *   dump <pid> <hex_start> <hex_end>
  *
@@ -84,8 +84,6 @@ static int build_ctl_args(char *out, int outsz, int argc, char **argv, int ci)
         snprintf(out, outsz, "ping");
     } else if (strcmp(argv[ci], "ps") == 0) {
         snprintf(out, outsz, "ps");
-    } else if (strcmp(argv[ci], "psx") == 0) {
-        snprintf(out, outsz, "psx");
     } else if (strcmp(argv[ci], "find") == 0 && ci + 1 < argc) {
         snprintf(out, outsz, "find %s", argv[ci + 1]);
     } else if (strcmp(argv[ci], "maps") == 0 && ci + 1 < argc) {
@@ -105,7 +103,7 @@ static void usage(const char *prog)
     fprintf(stderr,
         "Usage: %s <cmd> [args]\n"
         "\nCommands:\n"
-        "  ping, ps, psx, find <name>, maps <pid>\n"
+        "  ping, ps, find <name>, maps <pid>\n"
         "  read <pid> <hex_addr> <size>\n"
         "  dump <pid> <hex_start> <hex_end>\n",
         prog);
