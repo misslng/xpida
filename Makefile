@@ -20,9 +20,10 @@ INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 
 KPM_CFLAGS := -fno-pic -fno-PIC \
 	-fno-stack-protector \
-	-fno-asynchronous-unwind-tables -fno-unwind-tables
+	-fno-asynchronous-unwind-tables -fno-unwind-tables \
+	-mcmodel=large
 
-objs := xpida.o
+objs := xpida.o memhelpers.o
 
 all: xpida.kpm xpida_cli
 
@@ -30,7 +31,10 @@ xpida.kpm: ${objs}
 	${CC} -r -o $@ $^
 
 %.o: %.c
-	${CC} $(CFLAGS) $(KPM_CFLAGS) $(INCLUDE_FLAGS) -Txpida.lds -c -O2 -o $@ $<
+	${CC} $(CFLAGS) $(KPM_CFLAGS) $(INCLUDE_FLAGS) -c -O2 -o $@ $<
+
+%.o: %.S
+	${CC} -c -o $@ $<
 
 CLI_CFLAGS := -I$(KP_DIR)/kernel/patch/include -O2 -static
 

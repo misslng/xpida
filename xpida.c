@@ -36,6 +36,11 @@ KPM_DESCRIPTION("xpida Process Memory Tool");
 #define F_PATH_OFF      16
 #define FOLL_FORCE      0x10
 
+#define OUTPUT_PATH      "/data/local/tmp/xpida_result"
+#define OUTPUT_PATH_BIN  "/data/local/tmp/xpida_result.bin"
+#define OUTPUT_PATH_DUMP "/data/local/tmp/xpida_dump.bin"
+#define DUMP_CHUNK       (4096 * 16)
+
 /* ---- Global state ---- */
 
 static int g_ready;
@@ -60,6 +65,12 @@ static void (*fn_rcu_unlock)(void);
 static char *(*fn_d_path)(const void *path, char *buf, int buflen);
 static int (*fn_access_process_vm)(void *tsk, unsigned long addr, void *buf, int len, unsigned int gup);
 
+struct file;
+static struct file *(*fn_filp_open)(const char *, int, unsigned short);
+static long (*fn_kernel_write)(struct file *, const void *, unsigned long, long long *);
+static int (*fn_filp_close)(struct file *, void *);
+static void (*fn_vfs_fsync)(struct file *, int);
+
 /* ---- Safe memory access ---- */
 
 static long (*safe_copy)(void *dst, const void *src, size_t size);
@@ -78,6 +89,43 @@ static int safe_read_buf(uintptr_t addr, void *buf, size_t len)
         return safe_copy(buf, (const void *)addr, len) ? -1 : 0;
     __builtin_memcpy(buf, (const void *)addr, len);
     return 0;
+}
+
+/* ---- Output helpers ---- */
+
+#define PTR_IS_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095L)
+
+static int write_file(const char *path, const void *data, int len)
+{
+    if (!fn_filp_open || !fn_kernel_write || !fn_filp_close) {
+        pr_err("[xpida] write_file: file_io funcs not resolved\n");
+        return -1;
+    }
+    struct file *fp = fn_filp_open(path, 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
+    if (!fp || PTR_IS_ERR(fp)) {
+        pr_err("[xpida] write_file: filp_open failed: %ld\n", (long)fp);
+        return -1;
+    }
+    long long pos = 0;
+    long ret = fn_kernel_write(fp, data, len, &pos);
+    pr_info("[xpida] write_file: %s len=%d ret=%ld\n", path, len, ret);
+    if (fn_vfs_fsync) fn_vfs_fsync(fp, 0);
+    fn_filp_close(fp, 0);
+    return ret > 0 ? 0 : -1;
+}
+
+static void output_text(char *__user out_msg, int outlen, const char *data, int len)
+{
+    if (out_msg && outlen > 0)
+        compat_copy_to_user(out_msg, data, len < outlen ? len : outlen);
+    write_file(OUTPUT_PATH, data, len);
+}
+
+static void output_bin(char *__user out_msg, int outlen, const void *data, int len)
+{
+    if (out_msg && outlen > 0)
+        compat_copy_to_user(out_msg, data, len < outlen ? len : outlen);
+    write_file(OUTPUT_PATH_BIN, data, len);
 }
 
 /* ---- Offset helpers ---- */
@@ -134,36 +182,75 @@ static void probe_vma_offsets(uintptr_t mm_addr)
     }
     if (g_mmap_off < 0) return;
 
-    uintptr_t first = 0;
-    safe_read_ptr(mm_addr + g_mmap_off, &first);
-    if (!first) return;
+    uintptr_t vmas[32];
+    int nvma = 0;
+    uintptr_t cur = 0;
+    safe_read_ptr(mm_addr + g_mmap_off, &cur);
+    while (cur >= 0xffff000000000000ULL && nvma < 32) {
+        vmas[nvma++] = cur;
+        uintptr_t nx = 0;
+        safe_read_ptr(cur + 16, &nx);
+        cur = nx;
+    }
+    if (!nvma) return;
 
     for (int off = 64; off < 160; off += 8) {
         uintptr_t v = 0;
-        safe_read_ptr(first + off, &v);
+        safe_read_ptr(vmas[0] + off, &v);
         if (v > 0 && v < 0x100000000ULL && (v & VM_READ)) {
             g_vm_flags_off = off;
             break;
         }
     }
 
-    for (int off = 128; off < 208; off += 8) {
-        int has_null = 0, has_ptr = 0;
-        uintptr_t vma = first;
-        for (int i = 0; i < 20 && vma; i++) {
+    /* probe vm_file: field that is NULL for anon VMAs, kernel ptr for file-backed.
+     * validate with d_path to confirm it's actually struct file*. */
+    for (int off = 64; off < 256; off += 8) {
+        int has_null = 0;
+        uintptr_t good_fp = 0;
+        for (int i = 0; i < nvma; i++) {
             uintptr_t v = 0;
-            safe_read_ptr(vma + off, &v);
+            safe_read_ptr(vmas[i] + off, &v);
             if (v == 0) has_null = 1;
-            else if (v >= 0xffff000000000000ULL) has_ptr = 1;
-            uintptr_t nx = 0;
-            safe_read_ptr(vma + 16, &nx);
-            vma = (nx >= 0xffff000000000000ULL) ? nx : 0;
+            else if (v >= 0xffff000000000000ULL && !good_fp) good_fp = v;
         }
-        if (has_null && has_ptr) {
+        if (!has_null || !good_fp) continue;
+
+        if (fn_d_path) {
+            char tmpbuf[256];
+            uintptr_t mnt = 0, den = 0;
+            safe_read_ptr(good_fp + F_PATH_OFF, &mnt);
+            safe_read_ptr(good_fp + F_PATH_OFF + 8, &den);
+            if (mnt < 0xffff000000000000ULL || den < 0xffff000000000000ULL)
+                continue;
+            char *p = fn_d_path((const void *)(good_fp + F_PATH_OFF),
+                                tmpbuf, sizeof(tmpbuf));
+            if (!p || (uintptr_t)p < (uintptr_t)tmpbuf ||
+                (uintptr_t)p >= (uintptr_t)tmpbuf + sizeof(tmpbuf) || p[0] != '/')
+                continue;
             g_vm_file_off = off;
-            g_vm_pgoff_off = off - 8;
-            break;
+            pr_info("[xpida] vm_file at +%d validated: %s\n", off, p);
+        } else {
+            g_vm_file_off = off;
         }
+        break;
+    }
+
+    /* probe vm_pgoff: search near vm_file for a field that is NOT a kernel ptr
+     * and is a plausible page offset (small value) for most VMAs. */
+    if (g_vm_file_off > 0) {
+        int best = -1;
+        for (int off = g_vm_file_off - 40; off < g_vm_file_off + 40; off += 8) {
+            if (off < 0 || off == g_vm_file_off) continue;
+            int ok = 1;
+            for (int i = 0; i < nvma && i < 15; i++) {
+                uintptr_t v = 0;
+                safe_read_ptr(vmas[i] + off, &v);
+                if (v >= 0xffff000000000000ULL) { ok = 0; break; }
+            }
+            if (ok) { best = off; break; }
+        }
+        if (best >= 0) g_vm_pgoff_off = best;
     }
 }
 
@@ -266,7 +353,8 @@ static long cmd_find(const char *name, char *__user out_msg, int outlen)
 {
     if (!name || !name[0]) return -1;
 
-    char *kbuf = fn_vmalloc(outlen);
+    int bufsz = outlen > 0 ? outlen : 4096;
+    char *kbuf = fn_vmalloc(bufsz);
     if (!kbuf) return -1;
     int off = 0, found = 0;
 
@@ -294,8 +382,8 @@ static long cmd_find(const char *name, char *__user out_msg, int outlen)
         if (match && (nlen <= 15 || comm[15] == '\0')) {
             int32_t pid = 0;
             if (g_pid_off > 0) safe_read_buf(task + g_pid_off, &pid, 4);
-            if (off < outlen - 48)
-                off += snprintf(kbuf + off, outlen - off, "%d:%s\n", pid, comm);
+            if (off < bufsz - 48)
+                off += snprintf(kbuf + off, bufsz - off, "%d:%s\n", pid, comm);
             found++;
         }
         if (safe_read_ptr(pos, &pos) != 0) break;
@@ -303,10 +391,10 @@ static long cmd_find(const char *name, char *__user out_msg, int outlen)
 
 out:
     if (fn_rcu_unlock) fn_rcu_unlock();
-    if (!found && off < outlen - 16)
-        off += snprintf(kbuf + off, outlen - off, "not_found\n");
+    if (!found && off < bufsz - 16)
+        off += snprintf(kbuf + off, bufsz - off, "not_found\n");
     kbuf[off] = '\0';
-    compat_copy_to_user(out_msg, kbuf, off + 1);
+    output_text(out_msg, outlen, kbuf, off + 1);
     fn_vfree(kbuf);
     return found > 0 ? 0 : -1;
 }
@@ -335,7 +423,8 @@ static long cmd_maps(const char *args, char *__user out_msg, int outlen)
     safe_read_ptr(task_addr + g_mm_off, &mm);
     if (mm < 0xffff000000000000ULL) return -1;
 
-    int bsz = outlen < MAPS_BUF_SIZE ? outlen : MAPS_BUF_SIZE;
+    int omax = outlen > 0 ? outlen : MAPS_BUF_SIZE;
+    int bsz = omax < MAPS_BUF_SIZE ? omax : MAPS_BUF_SIZE;
     char *kbuf = fn_vmalloc(bsz);
     if (!kbuf) return -1;
     int off = 0;
@@ -394,87 +483,181 @@ static long cmd_maps(const char *args, char *__user out_msg, int outlen)
     if (fn_rcu_unlock) fn_rcu_unlock();
 
     kbuf[off] = '\0';
-    compat_copy_to_user(out_msg, kbuf, off + 1);
+    output_text(out_msg, outlen, kbuf, off + 1);
     fn_vfree(kbuf);
     return 0;
 }
 
 /* ---- cmd_read: read process memory ---- */
 
-static long cmd_read_via_apm(uintptr_t task_addr, unsigned long addr, int size,
-                              char *__user out_msg, int outlen)
-{
-    char *kbuf = fn_vmalloc(size);
-    if (!kbuf) return -1;
-    int n = fn_access_process_vm((void *)task_addr, addr, kbuf, size, FOLL_FORCE);
-    if (n > 0)
-        compat_copy_to_user(out_msg, kbuf, n);
-    fn_vfree(kbuf);
-    return n > 0 ? n : -1;
-}
-
-static long cmd_read_via_phys(uintptr_t task_addr, unsigned long addr, int size,
-                               char *__user out_msg, int outlen)
-{
-    if (!g_linear_voffset) return -1;
-
-    uintptr_t mm = 0;
-    safe_read_ptr(task_addr + g_mm_off, &mm);
-    if (mm < 0xffff000000000000ULL) return -1;
-
-    uintptr_t pgd = 0;
-    safe_read_ptr(mm + g_pgd_off, &pgd);
-    if (pgd < 0xffff000000000000ULL) return -1;
-
-    char *kbuf = fn_vmalloc(size);
-    if (!kbuf) return -1;
-
-    int total = 0;
-    unsigned long cur = addr;
-    int rem = size;
-
-    while (rem > 0) {
-        int poff = cur & (PAGE_SZ - 1);
-        int chunk = rem < (PAGE_SZ - poff) ? rem : (PAGE_SZ - poff);
-
-        uint64_t pa = pgtable_phys(pgd, cur);
-        if (!pa) {
-            __builtin_memset(kbuf + total, 0, chunk);
-        } else {
-            uintptr_t kva = pa + g_linear_voffset;
-            if (safe_read_buf(kva, kbuf + total, chunk) != 0)
-                __builtin_memset(kbuf + total, 0, chunk);
-        }
-
-        cur += chunk;
-        total += chunk;
-        rem -= chunk;
-    }
-
-    compat_copy_to_user(out_msg, kbuf, total);
-    fn_vfree(kbuf);
-    return total;
-}
-
 static long cmd_read(const char *args, char *__user out_msg, int outlen)
 {
-    unsigned long addr = 0;
     int32_t pid = 0;
+    unsigned long addr = 0;
     int size = 0;
 
     if (sscanf(args, "%d %lx %d", &pid, &addr, &size) != 3) return -1;
     if (pid <= 0 || size <= 0) return -1;
     if (size > MAX_READ_SIZE) size = MAX_READ_SIZE;
-    if (size > outlen) size = outlen;
 
     if (fn_rcu_lock) fn_rcu_lock();
     uintptr_t task_addr = find_task_by_pid(pid);
     if (fn_rcu_unlock) fn_rcu_unlock();
     if (!task_addr) return -1;
 
-    if (fn_access_process_vm)
-        return cmd_read_via_apm(task_addr, addr, size, out_msg, outlen);
-    return cmd_read_via_phys(task_addr, addr, size, out_msg, outlen);
+    char *kbuf = fn_vmalloc(size);
+    if (!kbuf) return -1;
+    long ret = -1;
+
+    if (fn_access_process_vm) {
+        int n = fn_access_process_vm((void *)task_addr, addr, kbuf, size, FOLL_FORCE);
+        if (n > 0) { output_bin(out_msg, outlen, kbuf, n); ret = n; }
+    } else if (g_linear_voffset) {
+        uintptr_t mm = 0;
+        safe_read_ptr(task_addr + g_mm_off, &mm);
+        if (mm >= 0xffff000000000000ULL) {
+            uintptr_t pgd = 0;
+            safe_read_ptr(mm + g_pgd_off, &pgd);
+            if (pgd >= 0xffff000000000000ULL) {
+                int total = 0, rem = size;
+                unsigned long cur = addr;
+                while (rem > 0) {
+                    int poff = cur & (PAGE_SZ - 1);
+                    int chunk = rem < (PAGE_SZ - poff) ? rem : (PAGE_SZ - poff);
+                    uint64_t pa = pgtable_phys(pgd, cur);
+                    if (pa)
+                        safe_read_buf(pa + g_linear_voffset, kbuf + total, chunk);
+                    else
+                        for (int z = 0; z < chunk; z++) kbuf[total + z] = 0;
+                    cur += chunk; total += chunk; rem -= chunk;
+                }
+                output_bin(out_msg, outlen, kbuf, total);
+                ret = total;
+            }
+        }
+    }
+
+    fn_vfree(kbuf);
+    return ret;
+}
+
+/* ---- cmd_ps: list all processes ---- */
+
+static long cmd_ps(char *__user out_msg, int outlen)
+{
+    int bufsz = outlen > 0 ? outlen : (128 * 1024);
+    char *kbuf = fn_vmalloc(bufsz);
+    if (!kbuf) return -1;
+    int off = 0, count = 0;
+
+    uintptr_t init_head = (uintptr_t)g_init_task + g_tasks_off;
+    uintptr_t pos = 0;
+
+    if (fn_rcu_lock) fn_rcu_lock();
+    if (safe_read_ptr(init_head, &pos) != 0) goto out;
+
+    while (pos != init_head && count++ < MAX_PROCESSES) {
+        uintptr_t task = pos - g_tasks_off;
+        int32_t pid = 0;
+        char comm[16] = { 0 };
+        if (g_pid_off > 0) safe_read_buf(task + g_pid_off, &pid, 4);
+        safe_read_buf(task + g_comm_off, comm, 16);
+        comm[15] = '\0';
+        if (pid > 0 && off < bufsz - 48)
+            off += snprintf(kbuf + off, bufsz - off, "%d:%s\n", pid, comm);
+        if (safe_read_ptr(pos, &pos) != 0) break;
+    }
+
+out:
+    if (fn_rcu_unlock) fn_rcu_unlock();
+    kbuf[off] = '\0';
+    output_text(out_msg, outlen, kbuf, off + 1);
+    fn_vfree(kbuf);
+    return count > 0 ? 0 : -1;
+}
+
+/* ---- cmd_dump: dump process memory region to file ---- */
+
+static int write_file_append(struct file *fp, const void *data, int len, long long *pos)
+{
+    if (!fp || !fn_kernel_write) return -1;
+    long ret = fn_kernel_write(fp, data, len, pos);
+    return ret > 0 ? 0 : -1;
+}
+
+static long cmd_dump(const char *args, char *__user out_msg, int outlen)
+{
+    int32_t pid = 0;
+    unsigned long start = 0, end = 0;
+
+    if (sscanf(args, "%d %lx %lx", &pid, &start, &end) != 3) return -1;
+    if (pid <= 0 || end <= start) return -1;
+
+    unsigned long total_size = end - start;
+    if (total_size > 64 * 1024 * 1024) total_size = 64 * 1024 * 1024;
+
+    if (fn_rcu_lock) fn_rcu_lock();
+    uintptr_t task_addr = find_task_by_pid(pid);
+    if (fn_rcu_unlock) fn_rcu_unlock();
+    if (!task_addr) return -1;
+
+    if (!fn_filp_open || !fn_kernel_write || !fn_filp_close) return -1;
+    struct file *fp = fn_filp_open(OUTPUT_PATH_DUMP,
+                                   0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
+    if (!fp || PTR_IS_ERR(fp)) return -1;
+
+    char *chunk = fn_vmalloc(DUMP_CHUNK);
+    if (!chunk) { fn_filp_close(fp, 0); return -1; }
+
+    long long fpos = 0;
+    unsigned long cur = start;
+    long written = 0;
+
+    while (cur < start + total_size) {
+        int sz = DUMP_CHUNK;
+        if (cur + sz > start + total_size) sz = (int)(start + total_size - cur);
+
+        int got = 0;
+        if (fn_access_process_vm) {
+            got = fn_access_process_vm((void *)task_addr, cur, chunk, sz, FOLL_FORCE);
+        } else if (g_linear_voffset) {
+            uintptr_t mm = 0;
+            safe_read_ptr(task_addr + g_mm_off, &mm);
+            if (mm >= 0xffff000000000000ULL) {
+                uintptr_t pgd = 0;
+                safe_read_ptr(mm + g_pgd_off, &pgd);
+                if (pgd >= 0xffff000000000000ULL) {
+                    int pos2 = 0, rem = sz;
+                    unsigned long c = cur;
+                    while (rem > 0) {
+                        int poff = c & (PAGE_SZ - 1);
+                        int blk = rem < (PAGE_SZ - poff) ? rem : (PAGE_SZ - poff);
+                        uint64_t pa = pgtable_phys(pgd, c);
+                        if (pa)
+                            safe_read_buf(pa + g_linear_voffset, chunk + pos2, blk);
+                        else
+                            for (int z = 0; z < blk; z++) chunk[pos2 + z] = 0;
+                        c += blk; pos2 += blk; rem -= blk;
+                    }
+                    got = sz;
+                }
+            }
+        }
+
+        if (got <= 0) break;
+        write_file_append(fp, chunk, got, &fpos);
+        written += got;
+        cur += got;
+    }
+
+    if (fn_vfs_fsync) fn_vfs_fsync(fp, 0);
+    fn_filp_close(fp, 0);
+    fn_vfree(chunk);
+
+    char msg[128];
+    int mlen = snprintf(msg, sizeof(msg), "dumped %ld bytes to " OUTPUT_PATH_DUMP "\n", written);
+    output_text(out_msg, outlen, msg, mlen + 1);
+    return written > 0 ? 0 : -1;
 }
 
 /* ---- CTL0 dispatcher ---- */
@@ -482,8 +665,7 @@ static long cmd_read(const char *args, char *__user out_msg, int outlen)
 static long xpida_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!g_ready) {
-        const char *msg = "error: not ready\n";
-        compat_copy_to_user(out_msg, msg, 18);
+        output_text(out_msg, outlen, "error: not ready\n", 18);
         return -1;
     }
     if (!args || !args[0]) return -1;
@@ -496,12 +678,16 @@ static long xpida_control0(const char *args, char *__user out_msg, int outlen)
         return cmd_maps(args + 5, out_msg, outlen);
     if (args[0] == 'r' && args[1] == 'e' && args[2] == 'a' && args[3] == 'd' && args[4] == ' ')
         return cmd_read(args + 5, out_msg, outlen);
+    if (args[0] == 'd' && args[1] == 'u' && args[2] == 'm' && args[3] == 'p' && args[4] == ' ')
+        return cmd_dump(args + 5, out_msg, outlen);
+    if (args[0] == 'p' && args[1] == 's' && (args[2] == '\0' || args[2] == ' '))
+        return cmd_ps(out_msg, outlen);
     if (args[0] == 'p' && args[1] == 'i' && args[2] == 'n' && args[3] == 'g') {
-        compat_copy_to_user(out_msg, "pong\n", 6);
+        output_text(out_msg, outlen, "pong\n", 6);
         return 0;
     }
 
-    compat_copy_to_user(out_msg, "find|maps|read|ping\n", 21);
+    output_text(out_msg, outlen, "dump|ps|find|maps|read|ping\n", 29);
     return -1;
 }
 
@@ -531,8 +717,16 @@ static long xpida_init(const char *args, const char *event, void *__user reserve
     fn_access_process_vm = (typeof(fn_access_process_vm))
         kallsyms_lookup_name("access_process_vm");
 
-    pr_info("[xpida] d_path: %s, access_process_vm: %s\n",
-            fn_d_path ? "ok" : "no", fn_access_process_vm ? "ok" : "no");
+    fn_filp_open = (typeof(fn_filp_open))kallsyms_lookup_name("filp_open");
+    fn_kernel_write = (typeof(fn_kernel_write))kallsyms_lookup_name("kernel_write");
+    if (!fn_kernel_write)
+        fn_kernel_write = (typeof(fn_kernel_write))kallsyms_lookup_name("__kernel_write");
+    fn_filp_close = (typeof(fn_filp_close))kallsyms_lookup_name("filp_close");
+    fn_vfs_fsync = (typeof(fn_vfs_fsync))kallsyms_lookup_name("vfs_fsync");
+
+    pr_info("[xpida] d_path: %s, access_process_vm: %s, file_io: %s\n",
+            fn_d_path ? "ok" : "no", fn_access_process_vm ? "ok" : "no",
+            (fn_filp_open && fn_kernel_write && fn_filp_close) ? "ok" : "no");
 
     if (resolve_offsets() != 0) {
         pr_err("[xpida] offset resolution failed\n");
