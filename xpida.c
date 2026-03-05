@@ -16,9 +16,10 @@
 #include <kputils.h>
 #include <linux/string.h>
 #include <pgtable.h>
+#include <syscall.h>
 
 KPM_NAME("xpida");
-KPM_VERSION("0.4.0");
+KPM_VERSION("0.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("xpida");
 KPM_DESCRIPTION("xpida Process Memory Tool");
@@ -36,10 +37,10 @@ KPM_DESCRIPTION("xpida Process Memory Tool");
 #define F_PATH_OFF      16
 #define FOLL_FORCE      0x10
 
-#define OUTPUT_PATH      "/data/local/tmp/xpida_result"
-#define OUTPUT_PATH_BIN  "/data/local/tmp/xpida_result.bin"
-#define OUTPUT_PATH_DUMP "/data/local/tmp/xpida_dump.bin"
 #define DUMP_CHUNK       (4096 * 16)
+
+#define XPIDA_MAGIC  0x7870696461ULL
+#define XPIDA_NR     __NR_userfaultfd
 
 /* ---- Config ---- */
 static bool use_fn_access_process_vm = false;
@@ -47,6 +48,7 @@ static bool use_fn_access_process_vm = false;
 /* ---- Global state ---- */
 
 static int g_ready;
+static int g_hooked;
 
 static struct task_struct *g_init_task;
 static int16_t g_tasks_off;
@@ -69,11 +71,6 @@ static void (*fn_rcu_unlock)(void);
 static char *(*fn_d_path)(const void *path, char *buf, int buflen);
 static int (*fn_access_process_vm)(void *tsk, unsigned long addr, void *buf, int len, unsigned int gup);
 
-struct file;
-static struct file *(*fn_filp_open)(const char *, int, unsigned short);
-static long (*fn_kernel_write)(struct file *, const void *, unsigned long, long long *);
-static int (*fn_filp_close)(struct file *, void *);
-static void (*fn_vfs_fsync)(struct file *, int);
 
 /* ---- Safe memory access ---- */
 
@@ -97,39 +94,16 @@ static int safe_read_buf(uintptr_t addr, void *buf, size_t len)
 
 /* ---- Output helpers ---- */
 
-#define PTR_IS_ERR(p) ((unsigned long)(p) >= (unsigned long)-4095L)
-
-static int write_file(const char *path, const void *data, int len)
-{
-    if (!fn_filp_open || !fn_kernel_write || !fn_filp_close) {
-        pr_err("[xpida] write_file: file_io funcs not resolved\n");
-        return -1;
-    }
-    struct file *fp = fn_filp_open(path, 0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
-    if (!fp || PTR_IS_ERR(fp)) {
-        pr_err("[xpida] write_file: filp_open failed: %ld\n", (long)fp);
-        return -1;
-    }
-    long long pos = 0;
-    long ret = fn_kernel_write(fp, data, len, &pos);
-    pr_info("[xpida] write_file: %s len=%d ret=%ld\n", path, len, ret);
-    if (fn_vfs_fsync) fn_vfs_fsync(fp, 0);
-    fn_filp_close(fp, 0);
-    return ret > 0 ? 0 : -1;
-}
-
 static void output_text(char *__user out_msg, int outlen, const char *data, int len)
 {
     if (out_msg && outlen > 0)
         compat_copy_to_user(out_msg, data, len < outlen ? len : outlen);
-    write_file(OUTPUT_PATH, data, len);
 }
 
 static void output_bin(char *__user out_msg, int outlen, const void *data, int len)
 {
     if (out_msg && outlen > 0)
         compat_copy_to_user(out_msg, data, len < outlen ? len : outlen);
-    write_file(OUTPUT_PATH_BIN, data, len);
 }
 
 /* ---- Offset helpers ---- */
@@ -691,14 +665,7 @@ out:
     return count > 0 ? 0 : -1;
 }
 
-/* ---- cmd_dump: dump process memory region to file ---- */
-
-static int write_file_append(struct file *fp, const void *data, int len, long long *pos)
-{
-    if (!fp || !fn_kernel_write) return -1;
-    long ret = fn_kernel_write(fp, data, len, pos);
-    return ret > 0 ? 0 : -1;
-}
+/* ---- cmd_dump: dump process memory to out_msg ---- */
 
 static long cmd_dump(const char *args, char *__user out_msg, int outlen)
 {
@@ -713,23 +680,19 @@ static long cmd_dump(const char *args, char *__user out_msg, int outlen)
 
     unsigned long total_size = end - start;
     if (total_size > 64 * 1024 * 1024) total_size = 64 * 1024 * 1024;
+    if ((unsigned long)outlen < total_size) {
+        pr_info("[xpida] dump: outlen %d < total %lu\n", outlen, total_size);
+        return -1;
+    }
 
     if (fn_rcu_lock) fn_rcu_lock();
     uintptr_t task_addr = find_task_by_pid(pid);
     if (fn_rcu_unlock) fn_rcu_unlock();
     if (!task_addr) { pr_info("[xpida] dump: task not found\n"); return -1; }
 
-    if (!fn_filp_open || !fn_kernel_write || !fn_filp_close) {
-        pr_info("[xpida] dump: file_io missing\n"); return -1;
-    }
-    struct file *fp = fn_filp_open(OUTPUT_PATH_DUMP,
-                                   0x241 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
-    if (!fp || PTR_IS_ERR(fp)) { pr_info("[xpida] dump: filp_open fail\n"); return -1; }
-
     char *chunk = fn_vmalloc(DUMP_CHUNK);
-    if (!chunk) { fn_filp_close(fp, 0); return -1; }
+    if (!chunk) return -1;
 
-    long long file_pos = 0;
     unsigned long cur = start;
     long written = 0;
 
@@ -783,7 +746,8 @@ static long cmd_dump(const char *args, char *__user out_msg, int outlen)
         }
 
         if (got <= 0) break;
-        write_file_append(fp, chunk, got, &file_pos);
+        if (out_msg)
+            compat_copy_to_user(out_msg + written, chunk, got);
         written += got;
         cur += got;
     }
@@ -791,17 +755,34 @@ static long cmd_dump(const char *args, char *__user out_msg, int outlen)
     pr_info("[xpida] dump: total_pg=%d pa_ok=%d pa_zero=%d rd_ok=%d rd_fail=%d written=%ld\n",
             dbg_n, dbg_pa_ok, dbg_pa_zero, dbg_rd_ok, dbg_rd_fail, written);
 
-    if (fn_vfs_fsync) fn_vfs_fsync(fp, 0);
-    fn_filp_close(fp, 0);
     fn_vfree(chunk);
-
-    char msg[128];
-    int mlen = snprintf(msg, sizeof(msg), "dumped %ld bytes to " OUTPUT_PATH_DUMP "\n", written);
-    output_text(out_msg, outlen, msg, mlen + 1);
-    return written > 0 ? 0 : -1;
+    return written;
 }
 
 /* ---- CTL0 dispatcher ---- */
+
+/*
+ * 从 args 末尾解析嵌入的用户态 buffer：" @<hex_addr> <hex_len>"
+ * SuKiSU ioctl 模式没有 out_msg，CLI 把自己的 buffer 地址编码在 args 里。
+ * 返回纯命令部分的长度（截掉 @... 后缀）。
+ */
+static int extract_user_buf(const char *args, char *__user *out, int *olen)
+{
+    const char *at = args;
+    const char *found = 0;
+    while (*at) {
+        if (at[0] == ' ' && at[1] == '@') { found = at; break; }
+        at++;
+    }
+    if (!found) return -1;
+    unsigned long addr = 0, len = 0;
+    if (sscanf(found + 2, "%lx %lx", &addr, &len) == 2 && addr && len) {
+        *out = (char *__user)addr;
+        *olen = (int)len;
+        return (int)(found - args);
+    }
+    return -1;
+}
 
 static long xpida_control0(const char *args, char *__user out_msg, int outlen)
 {
@@ -811,25 +792,76 @@ static long xpida_control0(const char *args, char *__user out_msg, int outlen)
     }
     if (!args || !args[0]) return -1;
 
-    pr_info("[xpida] ctl0: %s\n", args);
+    /*
+     * 如果 out_msg 为 NULL（ioctl 模式），尝试从 args 尾部取嵌入 buffer。
+     * 格式: "实际命令 @<hex_buf_addr> <hex_buf_len>"
+     */
+    char clean[1024];
+    int clen = (int)__builtin_strlen(args);
+    if (clen >= (int)sizeof(clean)) clen = (int)sizeof(clean) - 1;
+    __builtin_memcpy(clean, args, clen);
+    clean[clen] = '\0';
 
-    if (args[0] == 'f' && args[1] == 'i' && args[2] == 'n' && args[3] == 'd' && args[4] == ' ')
-        return cmd_find(args + 5, out_msg, outlen);
-    if (args[0] == 'm' && args[1] == 'a' && args[2] == 'p' && args[3] == 's' && args[4] == ' ')
-        return cmd_maps(args + 5, out_msg, outlen);
-    if (args[0] == 'r' && args[1] == 'e' && args[2] == 'a' && args[3] == 'd' && args[4] == ' ')
-        return cmd_read(args + 5, out_msg, outlen);
-    if (args[0] == 'd' && args[1] == 'u' && args[2] == 'm' && args[3] == 'p' && args[4] == ' ')
-        return cmd_dump(args + 5, out_msg, outlen);
-    if (args[0] == 'p' && args[1] == 's' && (args[2] == '\0' || args[2] == ' '))
+    if (!out_msg) {
+        int cmd_len = extract_user_buf(clean, &out_msg, &outlen);
+        if (cmd_len > 0)
+            clean[cmd_len] = '\0';
+    }
+
+    pr_info("[xpida] ctl0: %s (out=%d)\n", clean, outlen);
+
+    if (clean[0] == 'f' && clean[1] == 'i' && clean[2] == 'n' && clean[3] == 'd' && clean[4] == ' ')
+        return cmd_find(clean + 5, out_msg, outlen);
+    if (clean[0] == 'm' && clean[1] == 'a' && clean[2] == 'p' && clean[3] == 's' && clean[4] == ' ')
+        return cmd_maps(clean + 5, out_msg, outlen);
+    if (clean[0] == 'r' && clean[1] == 'e' && clean[2] == 'a' && clean[3] == 'd' && clean[4] == ' ')
+        return cmd_read(clean + 5, out_msg, outlen);
+    if (clean[0] == 'd' && clean[1] == 'u' && clean[2] == 'm' && clean[3] == 'p' && clean[4] == ' ')
+        return cmd_dump(clean + 5, out_msg, outlen);
+    if (clean[0] == 'p' && clean[1] == 's' && (clean[2] == '\0' || clean[2] == ' '))
         return cmd_ps(out_msg, outlen);
-    if (args[0] == 'p' && args[1] == 'i' && args[2] == 'n' && args[3] == 'g') {
+    if (clean[0] == 'p' && clean[1] == 'i' && clean[2] == 'n' && clean[3] == 'g') {
         output_text(out_msg, outlen, "pong\n", 6);
         return 0;
     }
 
     output_text(out_msg, outlen, "dump|ps|find|maps|read|ping\n", 29);
     return -1;
+}
+
+/* ---- Syscall hook handler ---- */
+
+static void before_userfaultfd(hook_fargs4_t *fargs, void *udata)
+{
+    uint64_t magic = syscall_argn(fargs, 0);
+    if (magic != XPIDA_MAGIC)
+        return;
+
+    fargs->skip_origin = 1;
+
+    if (current_uid() != 0) {
+        fargs->ret = (uint64_t)(long)-1;
+        return;
+    }
+
+    if (!g_ready) {
+        fargs->ret = (uint64_t)(long)-1;
+        return;
+    }
+
+    char __user *args_u = (char __user *)syscall_argn(fargs, 1);
+    char __user *out_buf = (char __user *)syscall_argn(fargs, 2);
+    int out_len = (int)syscall_argn(fargs, 3);
+
+    char args[1024];
+    long slen = compat_strncpy_from_user(args, args_u, sizeof(args));
+    if (slen <= 0) {
+        fargs->ret = (uint64_t)(long)-1;
+        return;
+    }
+
+    long ret = xpida_control0(args, out_buf, out_len);
+    fargs->ret = (uint64_t)ret;
 }
 
 /* ---- Init / Exit ---- */
@@ -862,16 +894,8 @@ static long xpida_init(const char *args, const char *event, void *__user reserve
         fn_access_process_vm = NULL;
     }
 
-    fn_filp_open = (typeof(fn_filp_open))kallsyms_lookup_name("filp_open");
-    fn_kernel_write = (typeof(fn_kernel_write))kallsyms_lookup_name("kernel_write");
-    if (!fn_kernel_write)
-        fn_kernel_write = (typeof(fn_kernel_write))kallsyms_lookup_name("__kernel_write");
-    fn_filp_close = (typeof(fn_filp_close))kallsyms_lookup_name("filp_close");
-    fn_vfs_fsync = (typeof(fn_vfs_fsync))kallsyms_lookup_name("vfs_fsync");
-
-    pr_info("[xpida] d_path: %s, access_process_vm: %s, file_io: %s\n",
-            fn_d_path ? "ok" : "no", fn_access_process_vm ? "ok" : "no",
-            (fn_filp_open && fn_kernel_write && fn_filp_close) ? "ok" : "no");
+    pr_info("[xpida] d_path: %s, access_process_vm: %s\n",
+            fn_d_path ? "ok" : "no", fn_access_process_vm ? "ok" : "no");
 
     if (resolve_offsets() != 0) {
         pr_err("[xpida] offset resolution failed\n");
@@ -879,12 +903,25 @@ static long xpida_init(const char *args, const char *event, void *__user reserve
     }
 
     g_ready = 1;
+
+    hook_err_t herr = hook_syscalln(XPIDA_NR, 1, before_userfaultfd, NULL, NULL);
+    if (herr != HOOK_NO_ERR) {
+        pr_err("[xpida] hook syscall %d failed: %d\n", XPIDA_NR, herr);
+    } else {
+        g_hooked = 1;
+        pr_info("[xpida] hooked syscall %d\n", XPIDA_NR);
+    }
+
     pr_info("[xpida] ready\n");
     return 0;
 }
 
 static long xpida_exit(void *__user reserved)
 {
+    if (g_hooked) {
+        unhook_syscalln(XPIDA_NR, before_userfaultfd, NULL);
+        g_hooked = 0;
+    }
     g_ready = 0;
     pr_info("[xpida] exit\n");
     return 0;
