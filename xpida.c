@@ -556,6 +556,67 @@ static void format_perms(unsigned long f, char *b)
     b[4] = '\0';
 }
 
+/*
+ * Snapshot one VMA's fields and verify consistency by reading twice.
+ * Returns 1 on success (fields are consistent), 0 on mismatch / error.
+ */
+struct vma_snap {
+    uintptr_t vs, ve;
+    unsigned long flags;
+    unsigned long pgoff;
+    uintptr_t file_ptr;
+    uintptr_t next;
+};
+
+static int snapshot_vma(uintptr_t vma, struct vma_snap *s)
+{
+    struct vma_snap a, b;
+
+    if (safe_read_ptr(vma, &a.vs) != 0) return 0;
+    if (safe_read_ptr(vma + 8, &a.ve) != 0) return 0;
+
+    a.flags = 0;
+    if (g_vm_flags_off > 0)
+        safe_read_buf(vma + g_vm_flags_off, &a.flags, sizeof(a.flags));
+
+    a.pgoff = 0;
+    if (g_vm_pgoff_off > 0)
+        safe_read_buf(vma + g_vm_pgoff_off, &a.pgoff, sizeof(a.pgoff));
+
+    a.file_ptr = 0;
+    if (g_vm_file_off > 0)
+        safe_read_ptr(vma + g_vm_file_off, &a.file_ptr);
+
+    if (safe_read_ptr(vma + 16, &a.next) != 0) return 0;
+
+    /* barrier / second read */
+    asm volatile("dmb ish" ::: "memory");
+
+    if (safe_read_ptr(vma, &b.vs) != 0) return 0;
+    if (safe_read_ptr(vma + 8, &b.ve) != 0) return 0;
+
+    b.flags = 0;
+    if (g_vm_flags_off > 0)
+        safe_read_buf(vma + g_vm_flags_off, &b.flags, sizeof(b.flags));
+
+    b.pgoff = 0;
+    if (g_vm_pgoff_off > 0)
+        safe_read_buf(vma + g_vm_pgoff_off, &b.pgoff, sizeof(b.pgoff));
+
+    b.file_ptr = 0;
+    if (g_vm_file_off > 0)
+        safe_read_ptr(vma + g_vm_file_off, &b.file_ptr);
+
+    if (safe_read_ptr(vma + 16, &b.next) != 0) return 0;
+
+    if (a.vs != b.vs || a.ve != b.ve || a.flags != b.flags ||
+        a.pgoff != b.pgoff || a.file_ptr != b.file_ptr || a.next != b.next)
+        return 0;
+
+    *s = a;
+    return 1;
+}
+
 static long cmd_maps(const char *args, char *__user out_msg, int outlen)
 {
     int32_t pid = 0;
@@ -578,44 +639,51 @@ static long cmd_maps(const char *args, char *__user out_msg, int outlen)
     safe_read_ptr(task_addr + g_mm_off, &mm);
     if (mm < 0xffff000000000000ULL) goto out;
 
-    uintptr_t vma = 0;
-    safe_read_ptr(mm + g_mmap_off, &vma);
-    int vc = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uintptr_t head_before = 0;
+        safe_read_ptr(mm + g_mmap_off, &head_before);
 
-    while (vma >= 0xffff000000000000ULL && vc++ < MAX_VMAS) {
-        uintptr_t vs = 0, ve = 0;
-        if (safe_read_ptr(vma, &vs) != 0) break;
-        if (safe_read_ptr(vma + 8, &ve) != 0) break;
-        if (ve <= vs || vs >= 0x800000000000ULL) break;
+        uintptr_t vma = head_before;
+        int vc = 0;
+        int inconsistent = 0;
+        off = 0;
 
-        unsigned long flags = 0;
-        if (g_vm_flags_off > 0)
-            safe_read_buf(vma + g_vm_flags_off, &flags, sizeof(flags));
+        while (vma >= 0xffff000000000000ULL && vc++ < MAX_VMAS) {
+            struct vma_snap snap;
+            int ok = 0;
 
-        char perms[5];
-        format_perms(flags, perms);
+            for (int retry = 0; retry < 3; retry++) {
+                if (snapshot_vma(vma, &snap)) { ok = 1; break; }
+            }
 
-        unsigned long pgoff = 0;
-        if (g_vm_pgoff_off > 0)
-            safe_read_buf(vma + g_vm_pgoff_off, &pgoff, sizeof(pgoff));
+            if (!ok) {
+                inconsistent = 1;
+                break;
+            }
 
-        const char *path = "";
-        if (g_vm_file_off > 0) {
-            uintptr_t fp = 0;
-            safe_read_ptr(vma + g_vm_file_off, &fp);
-            if (fp >= 0xffff000000000000ULL) {
-                if (safe_d_path_from_file(fp, pathbuf, sizeof(pathbuf)) > 0)
+            if (snap.ve <= snap.vs || snap.vs >= 0x800000000000ULL) break;
+
+            char perms[5];
+            format_perms(snap.flags, perms);
+
+            const char *path = "";
+            if (snap.file_ptr >= 0xffff000000000000ULL) {
+                if (safe_d_path_from_file(snap.file_ptr, pathbuf, sizeof(pathbuf)) > 0)
                     path = pathbuf;
             }
+
+            if (off < bsz - 128)
+                off += snprintf(kbuf + off, bsz - off, "%lx-%lx %s %08lx %s\n",
+                                snap.vs, snap.ve, perms,
+                                snap.pgoff << 12, path);
+
+            vma = snap.next;
         }
 
-        if (off < bsz - 128)
-            off += snprintf(kbuf + off, bsz - off, "%lx-%lx %s %08lx %s\n",
-                            vs, ve, perms, pgoff << 12, path);
-
-        uintptr_t next = 0;
-        if (safe_read_ptr(vma + 16, &next) != 0) break;
-        vma = next;
+        uintptr_t head_after = 0;
+        safe_read_ptr(mm + g_mmap_off, &head_after);
+        if (!inconsistent && head_before == head_after)
+            break;
     }
 
 out:
