@@ -436,6 +436,63 @@ static uintptr_t find_task_by_pid(int32_t target)
     return 0;
 }
 
+/* ---- RCU scope helpers ---- */
+
+static inline void rcu_lock(void)   { if (fn_rcu_lock) fn_rcu_lock(); }
+static inline void rcu_unlock(void) { if (fn_rcu_unlock) fn_rcu_unlock(); }
+
+/* ---- RCU-safe d_path via dentry walk ---- */
+
+#define DENTRY_D_PARENT_OFF    24
+#define DENTRY_D_NAME_OFF      32
+#define QSTR_NAME_OFF          8
+
+static int safe_d_path_from_file(uintptr_t fp, char *buf, int bufsz)
+{
+    uintptr_t dentry = 0;
+    safe_read_ptr(fp + F_PATH_OFF + 8, &dentry);
+    if (dentry < 0xffff000000000000ULL) return 0;
+
+    char segs[8][128];
+    int nseg = 0;
+
+    uintptr_t cur = dentry;
+    while (cur >= 0xffff000000000000ULL && nseg < 8) {
+        uintptr_t name_ptr = 0;
+        safe_read_ptr(cur + DENTRY_D_NAME_OFF + QSTR_NAME_OFF, &name_ptr);
+        if (name_ptr < 0xffff000000000000ULL) break;
+
+        char seg[128] = { 0 };
+        if (safe_read_buf(name_ptr, seg, 127) != 0) break;
+        seg[127] = '\0';
+        if (seg[0] == '/' || seg[0] == '\0') break;
+
+        int slen = 0;
+        while (seg[slen] && slen < 127) slen++;
+        __builtin_memcpy(segs[nseg], seg, slen + 1);
+        nseg++;
+
+        uintptr_t parent = 0;
+        safe_read_ptr(cur + DENTRY_D_PARENT_OFF, &parent);
+        if (parent == cur || parent < 0xffff000000000000ULL) break;
+        cur = parent;
+    }
+
+    if (!nseg) return 0;
+
+    int pos = 0;
+    for (int i = nseg - 1; i >= 0; i--) {
+        if (pos < bufsz - 1) buf[pos++] = '/';
+        int slen = 0;
+        while (segs[i][slen]) slen++;
+        int cp = slen < (bufsz - pos - 1) ? slen : (bufsz - pos - 1);
+        __builtin_memcpy(buf + pos, segs[i], cp);
+        pos += cp;
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
 /* ---- cmd_find: find process by name ---- */
 
 static long cmd_find(const char *name, char *__user out_msg, int outlen)
@@ -451,7 +508,7 @@ static long cmd_find(const char *name, char *__user out_msg, int outlen)
     uintptr_t pos = 0;
     int count = 0;
 
-    if (fn_rcu_lock) fn_rcu_lock();
+    rcu_lock();
     if (safe_read_ptr(init_head, &pos) != 0) goto out;
 
     int nlen = 0;
@@ -479,7 +536,7 @@ static long cmd_find(const char *name, char *__user out_msg, int outlen)
     }
 
 out:
-    if (fn_rcu_unlock) fn_rcu_unlock();
+    rcu_unlock();
     if (!found && off < bufsz - 16)
         off += snprintf(kbuf + off, bufsz - off, "not_found\n");
     kbuf[off] = '\0';
@@ -505,13 +562,6 @@ static long cmd_maps(const char *args, char *__user out_msg, int outlen)
     if (sscanf(args, "%d", &pid) != 1 || pid <= 0) return -1;
     if (g_mmap_off < 0) return -1;
 
-    uintptr_t task_addr = find_task_by_pid(pid);
-    if (!task_addr) return -1;
-
-    uintptr_t mm = 0;
-    safe_read_ptr(task_addr + g_mm_off, &mm);
-    if (mm < 0xffff000000000000ULL) return -1;
-
     int omax = outlen > 0 ? outlen : MAPS_BUF_SIZE;
     int bsz = omax < MAPS_BUF_SIZE ? omax : MAPS_BUF_SIZE;
     char *kbuf = fn_vmalloc(bsz);
@@ -519,17 +569,24 @@ static long cmd_maps(const char *args, char *__user out_msg, int outlen)
     int off = 0;
     char pathbuf[256];
 
+    rcu_lock();
+
+    uintptr_t task_addr = find_task_by_pid(pid);
+    if (!task_addr) goto out;
+
+    uintptr_t mm = 0;
+    safe_read_ptr(task_addr + g_mm_off, &mm);
+    if (mm < 0xffff000000000000ULL) goto out;
+
     uintptr_t vma = 0;
     safe_read_ptr(mm + g_mmap_off, &vma);
     int vc = 0;
 
-    if (fn_rcu_lock) fn_rcu_lock();
-
     while (vma >= 0xffff000000000000ULL && vc++ < MAX_VMAS) {
         uintptr_t vs = 0, ve = 0;
-        safe_read_ptr(vma, &vs);
-        safe_read_ptr(vma + 8, &ve);
-        if (ve <= vs) break;
+        if (safe_read_ptr(vma, &vs) != 0) break;
+        if (safe_read_ptr(vma + 8, &ve) != 0) break;
+        if (ve <= vs || vs >= 0x800000000000ULL) break;
 
         unsigned long flags = 0;
         if (g_vm_flags_off > 0)
@@ -543,20 +600,12 @@ static long cmd_maps(const char *args, char *__user out_msg, int outlen)
             safe_read_buf(vma + g_vm_pgoff_off, &pgoff, sizeof(pgoff));
 
         const char *path = "";
-        if (g_vm_file_off > 0 && fn_d_path) {
+        if (g_vm_file_off > 0) {
             uintptr_t fp = 0;
             safe_read_ptr(vma + g_vm_file_off, &fp);
             if (fp >= 0xffff000000000000ULL) {
-                uintptr_t mnt = 0, den = 0;
-                safe_read_ptr(fp + F_PATH_OFF, &mnt);
-                safe_read_ptr(fp + F_PATH_OFF + 8, &den);
-                if (mnt >= 0xffff000000000000ULL && den >= 0xffff000000000000ULL) {
-                    char *p = fn_d_path((const void *)(fp + F_PATH_OFF),
-                                        pathbuf, sizeof(pathbuf));
-                    if (p && (uintptr_t)p >= (uintptr_t)pathbuf &&
-                        (uintptr_t)p < (uintptr_t)pathbuf + sizeof(pathbuf) && p[0] == '/')
-                        path = p;
-                }
+                if (safe_d_path_from_file(fp, pathbuf, sizeof(pathbuf)) > 0)
+                    path = pathbuf;
             }
         }
 
@@ -565,16 +614,17 @@ static long cmd_maps(const char *args, char *__user out_msg, int outlen)
                             vs, ve, perms, pgoff << 12, path);
 
         uintptr_t next = 0;
-        safe_read_ptr(vma + 16, &next);
+        if (safe_read_ptr(vma + 16, &next) != 0) break;
         vma = next;
     }
 
-    if (fn_rcu_unlock) fn_rcu_unlock();
+out:
+    rcu_unlock();
 
     kbuf[off] = '\0';
     output_text(out_msg, outlen, kbuf, off + 1);
     fn_vfree(kbuf);
-    return 0;
+    return off > 0 ? 0 : -1;
 }
 
 /* ---- cmd_read: read process memory ---- */
@@ -589,18 +639,18 @@ static long cmd_read(const char *args, char *__user out_msg, int outlen)
     if (pid <= 0 || size <= 0) return -1;
     if (size > MAX_READ_SIZE) size = MAX_READ_SIZE;
 
-    if (fn_rcu_lock) fn_rcu_lock();
-    uintptr_t task_addr = find_task_by_pid(pid);
-    if (fn_rcu_unlock) fn_rcu_unlock();
-    if (!task_addr) return -1;
-
     char *kbuf = fn_vmalloc(size);
     if (!kbuf) return -1;
     long ret = -1;
 
+    rcu_lock();
+
+    uintptr_t task_addr = find_task_by_pid(pid);
+    if (!task_addr) goto out;
+
     if (fn_access_process_vm) {
         int n = fn_access_process_vm((void *)task_addr, addr, kbuf, size, FOLL_FORCE);
-        if (n > 0) { output_bin(out_msg, outlen, kbuf, n); ret = n; }
+        if (n > 0) ret = n;
     } else if (g_linear_voffset) {
         uintptr_t mm = 0;
         safe_read_ptr(task_addr + g_mm_off, &mm);
@@ -620,11 +670,16 @@ static long cmd_read(const char *args, char *__user out_msg, int outlen)
                         for (int z = 0; z < chunk; z++) kbuf[total + z] = 0;
                     cur += chunk; total += chunk; rem -= chunk;
                 }
-                output_bin(out_msg, outlen, kbuf, total);
                 ret = total;
             }
         }
     }
+
+out:
+    rcu_unlock();
+
+    if (ret > 0)
+        output_bin(out_msg, outlen, kbuf, ret);
 
     fn_vfree(kbuf);
     return ret;
@@ -642,7 +697,7 @@ static long cmd_ps(char *__user out_msg, int outlen)
     uintptr_t init_head = (uintptr_t)g_init_task + g_tasks_off;
     uintptr_t pos = 0;
 
-    if (fn_rcu_lock) fn_rcu_lock();
+    rcu_lock();
     if (safe_read_ptr(init_head, &pos) != 0) goto out;
 
     while (pos != init_head && count++ < MAX_PROCESSES) {
@@ -658,7 +713,7 @@ static long cmd_ps(char *__user out_msg, int outlen)
     }
 
 out:
-    if (fn_rcu_unlock) fn_rcu_unlock();
+    rcu_unlock();
     kbuf[off] = '\0';
     output_text(out_msg, outlen, kbuf, off + 1);
     fn_vfree(kbuf);
@@ -685,28 +740,33 @@ static long cmd_dump(const char *args, char *__user out_msg, int outlen)
         return -1;
     }
 
-    if (fn_rcu_lock) fn_rcu_lock();
-    uintptr_t task_addr = find_task_by_pid(pid);
-    if (fn_rcu_unlock) fn_rcu_unlock();
-    if (!task_addr) { pr_info("[xpida] dump: task not found\n"); return -1; }
-
     char *chunk = fn_vmalloc(DUMP_CHUNK);
     if (!chunk) return -1;
 
-    unsigned long cur = start;
-    long written = 0;
-
+    /* RCU 锁内只做查找 task/mm/pgd，拿到 pgd 后立即释放 */
+    rcu_lock();
+    uintptr_t task_addr = find_task_by_pid(pid);
     uintptr_t mm = 0, pgd = 0;
-    if (!fn_access_process_vm && g_linear_voffset) {
+    if (task_addr && !fn_access_process_vm && g_linear_voffset) {
         safe_read_ptr(task_addr + g_mm_off, &mm);
         if (mm >= 0xffff000000000000ULL)
             safe_read_ptr(mm + g_pgd_off, &pgd);
     }
+    rcu_unlock();
+
+    if (!task_addr) {
+        pr_info("[xpida] dump: task not found\n");
+        fn_vfree(chunk);
+        return -1;
+    }
+
     pr_info("[xpida] dump: apm=%s voff=%llx mm=%lx pgd=%lx plvl=%d\n",
             fn_access_process_vm ? "yes" : "no",
             (unsigned long long)g_linear_voffset,
             (unsigned long)mm, (unsigned long)pgd, g_user_page_level);
 
+    unsigned long cur = start;
+    long written = 0;
     int dbg_n = 0, dbg_pa_ok = 0, dbg_pa_zero = 0, dbg_rd_ok = 0, dbg_rd_fail = 0;
 
     while (cur < start + total_size) {
@@ -714,6 +774,9 @@ static long cmd_dump(const char *args, char *__user out_msg, int outlen)
         if (cur + sz > start + total_size) sz = (int)(start + total_size - cur);
 
         int got = 0;
+
+        rcu_lock();
+
         if (fn_access_process_vm) {
             got = fn_access_process_vm((void *)task_addr, cur, chunk, sz, FOLL_FORCE);
         } else if (g_linear_voffset && pgd >= 0xffff000000000000ULL) {
@@ -744,6 +807,8 @@ static long cmd_dump(const char *args, char *__user out_msg, int outlen)
             }
             got = sz;
         }
+
+        rcu_unlock();
 
         if (got <= 0) break;
         if (out_msg)
@@ -894,8 +959,9 @@ static long xpida_init(const char *args, const char *event, void *__user reserve
         fn_access_process_vm = NULL;
     }
 
-    pr_info("[xpida] d_path: %s, access_process_vm: %s\n",
-            fn_d_path ? "ok" : "no", fn_access_process_vm ? "ok" : "no");
+    pr_info("[xpida] d_path: %s, access_process_vm: %s, rcu: %s\n",
+            fn_d_path ? "ok" : "no", fn_access_process_vm ? "ok" : "no",
+            fn_rcu_lock ? "ok" : "no");
 
     if (resolve_offsets() != 0) {
         pr_err("[xpida] offset resolution failed\n");
